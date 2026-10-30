@@ -16,6 +16,7 @@ from aiogram.exceptions import TelegramBadRequest
 
 BOT_TOKEN = os.getenv("TOKEN")
 ADMIN_ID = 6113518001
+session = AiohttpSession(timeout=ClientTimeout(total=300))
 DB_PATH = "courses.db"
 PAGE_SIZE = 5
 
@@ -1171,7 +1172,7 @@ async def fallback_message(message: Message):
 # ============================================================
 async def main():
     await init_db()
-    bot = Bot(token=BOT_TOKEN)
+    bot = Bot(token=BOT_TOKEN, session=session)
     dp = Dispatcher()
     dp.include_router(router)
     print("Бот запущен...")
