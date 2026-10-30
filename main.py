@@ -1174,7 +1174,7 @@ async def fallback_message(message: Message):
 # ============================================================
 async def main():
     await init_db()
-    bot = Bot(token=BOT_TOKEN, session=session)
+    bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
     print("Бот запущен...")
