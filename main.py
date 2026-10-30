@@ -16,7 +16,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiohttp import ClientTimeout
 
-BOT_TOKEN = "7842967942:AAGPzCu4w8401CSsUJooURFwivvqp6GzIPc"
+BOT_TOKEN = os.getenv("TOKEN")
 ADMIN_ID = 6113518001
 session = AiohttpSession(timeout=ClientTimeout(total=300))
 DB_PATH = "courses.db"
