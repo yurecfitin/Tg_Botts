@@ -1,6 +1,6 @@
 import asyncio
-import aiosqlite
 import os
+import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -8,21 +8,17 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton,
-    FSInputFile,
+    ReplyKeyboardMarkup,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 
 BOT_TOKEN = os.getenv("TOKEN")
-ADMIN_ID = 6113518001        # ваш Telegram ID
+ADMIN_ID = 6113518001
 DB_PATH = "courses.db"
-VIDEO_PATH = "video.mp4"      # временное решение — одно видео для всех
 PAGE_SIZE = 5
 
 router = Router()
-
-# текущая страница списка курсов для каждого пользователя (нужна для reply-кнопок)
 user_buy_page: dict[int, int] = {}
 
 # ============================================================
@@ -34,14 +30,20 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS courses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
-                price TEXT NOT NULL
+                price TEXT NOT NULL,
+                video_file_id TEXT
             )""")
+        # авто-миграция старых баз
+        cur = await db.execute("PRAGMA table_info(courses)")
+        cols = [row[1] for row in await cur.fetchall()]
+        if "video_file_id" not in cols:
+            await db.execute("ALTER TABLE courses ADD COLUMN video_file_id TEXT")
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS purchases (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
-                course_id INTEGER NOT NULL,
-                FOREIGN KEY (course_id) REFERENCES courses(id)
+                course_id INTEGER NOT NULL
             )""")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS pending_purchases (
@@ -49,8 +51,9 @@ async def init_db():
                 user_id INTEGER NOT NULL,
                 course_id INTEGER NOT NULL
             )""")
-        cursor = await db.execute("SELECT COUNT(*) FROM courses")
-        if (await cursor.fetchone())[0] == 0:
+
+        cur = await db.execute("SELECT COUNT(*) FROM courses")
+        if (await cur.fetchone())[0] == 0:
             demo = [
                 ("Python с нуля", "4 900 ₽"),
                 ("Telegram-боты на aiogram 3", "6 900 ₽"),
@@ -59,7 +62,8 @@ async def init_db():
                 ("Docker и CI/CD", "5 900 ₽"),
                 ("Алгоритмы и структуры данных", "8 900 ₽"),
             ]
-            await db.executemany("INSERT INTO courses (name, price) VALUES (?, ?)", demo)
+            await db.executemany(
+                "INSERT INTO courses (name, price) VALUES (?, ?)", demo)
         await db.commit()
 
 
@@ -77,7 +81,8 @@ async def get_courses(page: int = 0):
 async def get_course(course_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, name, price FROM courses WHERE id = ?", (course_id,))
+            "SELECT id, name, price, video_file_id FROM courses WHERE id = ?",
+            (course_id,))
         return await cur.fetchone()
 
 
@@ -127,23 +132,30 @@ async def delete_pending(pending_id: int):
         await db.commit()
 
 
-async def update_course(course_id: int, name: str, price: str):
+async def update_course(course_id: int, name: str, price: str,
+                        video_file_id: str | None = None):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE courses SET name = ?, price = ? WHERE id = ?",
-            (name, price, course_id))
+        if video_file_id is None:
+            await db.execute(
+                "UPDATE courses SET name = ?, price = ? WHERE id = ?",
+                (name, price, course_id))
+        else:
+            await db.execute(
+                "UPDATE courses SET name = ?, price = ?, video_file_id = ? WHERE id = ?",
+                (name, price, video_file_id, course_id))
         await db.commit()
 
 
-async def create_course(name: str, price: str):
+async def create_course(name: str, price: str, video_file_id: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO courses (name, price) VALUES (?, ?)", (name, price))
+            "INSERT INTO courses (name, price, video_file_id) VALUES (?, ?, ?)",
+            (name, price, video_file_id))
         await db.commit()
 
 
 # ============================================================
-# УТИЛИТА БЕЗОПАСНОГО РЕДАКТИРОВАНИЯ
+# УТИЛИТЫ
 # ============================================================
 async def safe_edit(message: Message, text: str, reply_markup=None, parse_mode=None):
     try:
@@ -163,7 +175,6 @@ def main_inline_kb() -> InlineKeyboardMarkup:
 
 
 def main_reply_kb() -> ReplyKeyboardMarkup:
-    """Главное меню — всегда текстовая кнопка."""
     kb = ReplyKeyboardBuilder()
     kb.button(text="🏠 Главное меню")
     return kb.as_markup(resize_keyboard=True)
@@ -172,22 +183,18 @@ def main_reply_kb() -> ReplyKeyboardMarkup:
 def courses_page_kb(page: int, total: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
-
-    # назад — предыдущая страница или в главное меню
     if page > 0:
         kb.button(text="⬅ Назад", callback_data=f"courses_page:{page - 1}")
     else:
         kb.button(text="⬅ Назад", callback_data="main_menu")
-
     if page < total_pages - 1:
         kb.button(text="Вперёд ➡", callback_data=f"courses_page:{page + 1}")
-
-    kb.row(InlineKeyboardButton(text="🛒 Купить курсы", callback_data=f"buy_menu:{page}"))
+    kb.row(InlineKeyboardButton(text="🛒 Купить курсы",
+                                callback_data=f"buy_menu:{page}"))
     return kb.as_markup()
 
 
 def buy_course_reply_kb(courses: list) -> ReplyKeyboardMarkup:
-    """Обычные кнопки 1..5 + Главное меню."""
     kb = ReplyKeyboardBuilder()
     for i, (_, name, price) in enumerate(courses, start=1):
         kb.button(text=f"{i}. {name} — {price}")
@@ -210,8 +217,10 @@ class AdminStates(StatesGroup):
     choose_course = State()
     enter_name = State()
     enter_price = State()
+    enter_video = State()      # замена видео у существующего
     create_name = State()
     create_price = State()
+    create_video = State()     # видео при создании
 
 
 # ============================================================
@@ -222,9 +231,8 @@ async def cmd_start(message: Message):
     text = (
         "👋 Добро пожаловать!\n\n"
         "Этот бот создан для **покупки курсов**.\n"
-        "Здесь вы можете посмотреть доступные курсы, приобрести их "
-        "и получить доступ к уже купленным материалам.\n\n"
-        "Выберите действие ниже 👇"
+        "Посмотрите доступные курсы, купите их и получите доступ к видео.\n\n"
+        "Выберите действие 👇"
     )
     await message.answer(text, reply_markup=main_inline_kb(), parse_mode="Markdown")
     await message.answer("🏠 Кнопка «Главное меню» всегда внизу 👇",
@@ -244,7 +252,6 @@ async def main_menu_text(message: Message):
     await message.answer("Выберите действие:", reply_markup=main_inline_kb())
 
 
-# ---------- СПИСОК КУРСОВ ----------
 @router.callback_query(F.data.startswith("courses_page:"))
 async def show_courses(callback: CallbackQuery):
     page = int(callback.data.split(":")[1])
@@ -260,7 +267,6 @@ async def show_courses(callback: CallbackQuery):
     await callback.answer()
 
 
-# ---------- МЕНЮ ПОКУПКИ (REPLY-КНОПКИ) ----------
 @router.callback_query(F.data.startswith("buy_menu:"))
 async def buy_menu(callback: CallbackQuery):
     page = int(callback.data.split(":")[1])
@@ -269,22 +275,18 @@ async def buy_menu(callback: CallbackQuery):
         await safe_edit(callback.message, "Курсы не найдены.", main_inline_kb())
         await callback.answer()
         return
-
     user_buy_page[callback.from_user.id] = page
 
     back_kb = InlineKeyboardBuilder()
     back_kb.button(text="⬅ Назад", callback_data=f"courses_page:{page}")
-    await safe_edit(callback.message,
-                    "👇 Выберите курс из меню ниже:",
+    await safe_edit(callback.message, "👇 Выберите курс из меню ниже:",
                     back_kb.as_markup())
-
     await callback.message.answer(
         "Какой курс вы хотите купить?\nНажмите номер на клавиатуре ниже 👇",
         reply_markup=buy_course_reply_kb(courses))
     await callback.answer()
 
 
-# ---------- ВЫБОР КУРСА ЧЕРЕЗ REPLY (1..5) ----------
 @router.message(F.text.regexp(r"^\d+\. "))
 async def pick_course_reply(message: Message):
     user_id = message.from_user.id
@@ -301,15 +303,13 @@ async def pick_course_reply(message: Message):
         f"Вы выбрали:\n\n**{name}**\nЦена: **{price}**",
         reply_markup=course_detail_inline_kb(course_id, page),
         parse_mode="Markdown")
-    # возвращаем reply-клавиатуру к виду «только Главное меню»
-    await message.answer("🏠 Главное меню всегда доступно 👇", reply_markup=main_reply_kb())
+    await message.answer("🏠 Главное меню всегда доступно 👇",
+                         reply_markup=main_reply_kb())
 
 
-# ---------- КУПИТЬ КУРС → ЗАПРОС АДМИНУ ----------
 @router.callback_query(F.data.startswith("buy:"))
 async def buy_course(callback: CallbackQuery):
-    parts = callback.data.split(":")
-    course_id = int(parts[1])
+    course_id = int(callback.data.split(":")[1])
     course = await get_course(course_id)
     if not course:
         await callback.answer("Курс не найден.", show_alert=True)
@@ -344,7 +344,6 @@ async def buy_course(callback: CallbackQuery):
     await callback.answer("Запрос отправлен")
 
 
-# ---------- ВАШИ КУРСЫ ----------
 @router.callback_query(F.data == "my_courses")
 async def my_courses(callback: CallbackQuery):
     purchases = await get_user_courses(callback.from_user.id)
@@ -373,21 +372,23 @@ async def admin_confirm(callback: CallbackQuery):
         return
 
     _, user_id, course_id = pending
-    course = await get_course(course_id)
+    course = await get_course(course_id)  # id, name, price, video_file_id
     await add_purchase(user_id, course_id)
     await delete_pending(pending_id)
 
-    # уведомляем пользователя и отправляем видео
     try:
         await callback.bot.send_message(
             user_id,
             f"✅ Покупка подтверждена!\nКурс: **{course[1]}**\n\nОтправляю доступ...",
             parse_mode="Markdown")
-        await callback.bot.send_video(
-            user_id, FSInputFile(VIDEO_PATH),
-            caption=f"Курс: {course[1]}")
-        await callback.bot.send_message(
-            user_id, "🏠 Главное меню 👇", reply_markup=main_reply_kb())
+        if course[3]:  # video_file_id
+            await callback.bot.send_video(user_id, course[3],
+                                          caption=f"Курс: {course[1]}")
+        else:
+            await callback.bot.send_message(
+                user_id, "⚠ Видео курса пока не загружено администратором.")
+        await callback.bot.send_message(user_id, "🏠 Главное меню 👇",
+                                        reply_markup=main_reply_kb())
     except Exception as e:
         await callback.message.answer(f"⚠ Ошибка отправки пользователю: {e}")
 
@@ -415,8 +416,7 @@ async def admin_reject(callback: CallbackQuery):
 
     try:
         await callback.bot.send_message(
-            user_id,
-            "❌ К сожалению, покупка отклонена администратором.",
+            user_id, "❌ К сожалению, покупка отклонена администратором.",
             reply_markup=main_reply_kb())
     except Exception:
         pass
@@ -429,7 +429,7 @@ async def admin_reject(callback: CallbackQuery):
 
 
 # ============================================================
-# АДМИН-ПАНЕЛЬ (РЕДАКТИРОВАНИЕ КУРСОВ)
+# АДМИН-ПАНЕЛЬ: РЕДАКТИРОВАНИЕ
 # ============================================================
 @router.message(Command("admin"))
 async def admin_start(message: Message, state: FSMContext):
@@ -438,7 +438,7 @@ async def admin_start(message: Message, state: FSMContext):
         return
     courses, _ = await get_courses(0)
     if not courses:
-        await message.answer("Нет курсов. Добавьте через /add.")
+        await message.answer("Нет курсов. Добавьте через /admin → «Добавить курс».")
         return
     kb = InlineKeyboardBuilder()
     for course_id, name, price in courses:
@@ -471,12 +471,39 @@ async def admin_enter_name(message: Message, state: FSMContext):
 
 @router.message(AdminStates.enter_price)
 async def admin_enter_price(message: Message, state: FSMContext):
+    await state.update_data(new_price=message.text.strip())
+    await message.answer(
+        "Отправьте **новое видео** курса или /skip, чтобы оставить старое.")
+    await state.set_state(AdminStates.enter_video)
+
+
+@router.message(AdminStates.enter_video, Command("skip"))
+async def admin_skip_video(message: Message, state: FSMContext):
     data = await state.get_data()
-    await update_course(data["course_id"], data["new_name"], message.text.strip())
+    await update_course(data["course_id"], data["new_name"], data["new_price"])
     await state.clear()
-    await message.answer("✅ Курс обновлён.", reply_markup=main_inline_kb())
+    await message.answer("✅ Курс обновлён (видео без изменений).",
+                         reply_markup=main_inline_kb())
 
 
+@router.message(AdminStates.enter_video, F.video)
+async def admin_enter_video(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await update_course(data["course_id"], data["new_name"],
+                        data["new_price"], message.video.file_id)
+    await state.clear()
+    await message.answer("✅ Курс обновлён (видео заменено).",
+                         reply_markup=main_inline_kb())
+
+
+@router.message(AdminStates.enter_video)
+async def admin_enter_video_invalid(message: Message):
+    await message.answer("Отправьте видео или /skip.")
+
+
+# ============================================================
+# АДМИН-ПАНЕЛЬ: ДОБАВЛЕНИЕ
+# ============================================================
 @router.callback_query(F.data == "admin_add")
 async def admin_add_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
@@ -496,10 +523,27 @@ async def admin_create_name(message: Message, state: FSMContext):
 
 @router.message(AdminStates.create_price)
 async def admin_create_price(message: Message, state: FSMContext):
+    await state.update_data(create_price=message.text.strip())
+    await message.answer("Отправьте **видео** нового курса:")
+    await state.set_state(AdminStates.create_video)
+
+
+@router.message(AdminStates.create_video, F.video)
+async def admin_create_video(message: Message, state: FSMContext):
     data = await state.get_data()
-    await create_course(data["create_name"], message.text.strip())
+    await create_course(data["create_name"], data["create_price"],
+                        message.video.file_id)
     await state.clear()
-    await message.answer("✅ Новый курс добавлен.", reply_markup=main_inline_kb())
+    await message.answer(
+        "✅ Новый курс добавлен вместе с видео.\n\n"
+        "Его уже видят пользователи в разделе «Курсы».",
+        reply_markup=main_inline_kb())
+
+
+@router.message(AdminStates.create_video)
+async def admin_create_video_invalid(message: Message):
+    await message.answer("⚠ Нужно отправить именно **видео** файлом.", 
+                         parse_mode="Markdown")
 
 
 # ============================================================
