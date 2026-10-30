@@ -9,7 +9,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, ReplyKeyboardRemove,
+    ReplyKeyboardMarkup,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
@@ -201,9 +201,12 @@ def main_inline_kb() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def admin_reply_kb() -> ReplyKeyboardMarkup:
+def user_reply_kb(user_id: int) -> ReplyKeyboardMarkup:
+    """Постоянная нижняя панель: Главное меню (+ Админ панель для админа)."""
     kb = ReplyKeyboardBuilder()
-    kb.button(text="⚙️ Админ панель")
+    kb.button(text="🏠 Главное меню")
+    if user_id == ADMIN_ID:
+        kb.button(text="⚙️ Админ панель")
     return kb.as_markup(resize_keyboard=True)
 
 
@@ -229,10 +232,13 @@ def courses_page_kb(page: int, total: int) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def buy_course_reply_kb(courses: list) -> ReplyKeyboardMarkup:
+def buy_course_reply_kb(courses: list, user_id: int) -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardBuilder()
     for i, (_, name, price) in enumerate(courses, start=1):
         kb.button(text=f"{i}. {name} — {price}")
+    kb.button(text="🏠 Главное меню")
+    if user_id == ADMIN_ID:
+        kb.button(text="⚙️ Админ панель")
     kb.adjust(1)
     return kb.as_markup(resize_keyboard=True, one_time_keyboard=True)
 
@@ -278,30 +284,29 @@ async def cmd_start(message: Message, state: FSMContext):
         "Посмотрите доступные курсы, купите их и получите доступ к видео.\n\n"
         "Выберите действие:"
     )
-    await message.answer(text, reply_markup=main_inline_kb(), parse_mode="Markdown")
-
-    if message.from_user.id == ADMIN_ID:
-        # просто показываем reply-клавиатуру с «⚙️ Админ панель», без подсказок
-        await message.answer("⚙️", reply_markup=admin_reply_kb())
-    else:
-        # убираем возможные старые reply-клавиатуры у пользователя
-        await message.answer("👌", reply_markup=ReplyKeyboardRemove())
+    await message.answer(text, reply_markup=user_reply_kb(message.from_user.id),
+                         parse_mode="Markdown")
+    await message.answer("Доступные действия:", reply_markup=main_inline_kb())
 
 
 # ============================================================
-# ГЛАВНОЕ МЕНЮ (inline + ручной ввод текстом)
+# ГЛАВНОЕ МЕНЮ (нижняя кнопка + ручной ввод, работает в любом состоянии)
 # ============================================================
+@router.message(F.text.in_({"Главное меню", "🏠 Главное меню"}))
+async def main_menu_text(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("🏠 Главное меню",
+                         reply_markup=user_reply_kb(message.from_user.id))
+    await message.answer("Выберите действие:", reply_markup=main_inline_kb())
+
+
 @router.callback_query(F.data == "main_menu")
 async def main_menu_cb(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await safe_edit(callback.message, "🏠 Главное меню\n\nВыберите действие:",
-                    main_inline_kb())
+    await callback.message.answer("🏠 Главное меню",
+                                  reply_markup=user_reply_kb(callback.from_user.id))
+    await callback.message.answer("Выберите действие:", reply_markup=main_inline_kb())
     await callback.answer()
-
-
-@router.message(StateFilter(None), F.text.in_({"Главное меню", "🏠 Главное меню"}))
-async def main_menu_text(message: Message):
-    await message.answer("🏠 Главное меню", reply_markup=main_inline_kb())
 
 
 # ============================================================
@@ -339,7 +344,7 @@ async def buy_menu(callback: CallbackQuery):
                     back_kb.as_markup())
     await callback.message.answer(
         "Какой курс вы хотите купить?\nНажмите номер на клавиатуре ниже:",
-        reply_markup=buy_course_reply_kb(courses))
+        reply_markup=buy_course_reply_kb(courses, callback.from_user.id))
     await callback.answer()
 
 
@@ -371,6 +376,9 @@ async def pick_course_reply(message: Message):
         await message.answer("⚠ У этого курса нет ссылки на оплату.")
         return
 
+    # сбрасываем reply-панель к постоянной (Главное меню / Админ панель)
+    await message.answer("Курс выбран.",
+                         reply_markup=user_reply_kb(user_id))
     await message.answer(
         f"Вы выбрали:\n\n**{name}**\nЦена: **{price}**\n\n"
         f"1) Нажмите **💳 Купить** — откроется страница оплаты.\n"
@@ -406,13 +414,6 @@ async def start_receipt(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.message(PurchaseStates.waiting_receipt,
-                F.text.in_({"Главное меню", "🏠 Главное меню"}))
-async def cancel_receipt(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Покупка отменена.", reply_markup=main_inline_kb())
-
-
 @router.message(PurchaseStates.waiting_receipt, F.photo)
 async def receive_receipt(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
@@ -421,11 +422,12 @@ async def receive_receipt(message: Message, state: FSMContext, bot: Bot):
 
     if not course_id:
         await message.answer("Что-то пошло не так. Попробуйте снова.",
-                             reply_markup=main_inline_kb())
+                             reply_markup=user_reply_kb(message.from_user.id))
         return
     course = await get_course(course_id)
     if not course:
-        await message.answer("Курс не найден.", reply_markup=main_inline_kb())
+        await message.answer("Курс не найден.",
+                             reply_markup=user_reply_kb(message.from_user.id))
         return
 
     receipt_file_id = message.photo[-1].file_id
@@ -452,18 +454,17 @@ async def receive_receipt(message: Message, state: FSMContext, bot: Bot):
     except Exception as e:
         await delete_pending(pending_id)
         await message.answer(f"⚠ Не удалось отправить чек админу: {e}",
-                             reply_markup=main_inline_kb())
+                             reply_markup=user_reply_kb(message.from_user.id))
         return
 
     await message.answer("✅ Чек отправлен администратору. Ожидайте подтверждения.",
-                         reply_markup=main_inline_kb())
+                         reply_markup=user_reply_kb(message.from_user.id))
 
 
 @router.message(PurchaseStates.waiting_receipt)
 async def wrong_receipt(message: Message):
-    await message.answer(
-        "📸 Пожалуйста, отправьте именно **фото** чека об оплате "
-        "(или «🏠 Главное меню» для отмены).", parse_mode="Markdown")
+    await message.answer("📸 Пожалуйста, отправьте именно **фото** чека об оплате.",
+                         parse_mode="Markdown")
 
 
 # ============================================================
@@ -512,8 +513,8 @@ async def admin_confirm(callback: CallbackQuery):
         else:
             await callback.bot.send_message(
                 user_id, "⚠ Видео курса пока не загружено администратором.")
-        await callback.bot.send_message(user_id, "Главное меню:",
-                                        reply_markup=main_inline_kb())
+        await callback.bot.send_message(user_id, "Готово.",
+                                        reply_markup=user_reply_kb(user_id))
     except Exception as e:
         await callback.message.answer(f"⚠ Ошибка отправки пользователю: {e}")
 
@@ -549,7 +550,7 @@ async def admin_reject(callback: CallbackQuery):
     try:
         await callback.bot.send_message(
             user_id, "❌ К сожалению, покупка отклонена администратором.",
-            reply_markup=main_inline_kb())
+            reply_markup=user_reply_kb(user_id))
     except Exception:
         pass
 
@@ -748,7 +749,7 @@ async def admin_create_video_invalid(message: Message):
 
 
 # ============================================================
-# CATCH-ALL (я вас не понял)
+# CATCH-ALL
 # ============================================================
 @router.message(StateFilter(None))
 async def fallback_message(message: Message):
