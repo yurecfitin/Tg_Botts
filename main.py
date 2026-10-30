@@ -1,14 +1,15 @@
 import asyncio
-import aiosqlite
+import re
 import os
+import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup,
+    ReplyKeyboardMarkup, ReplyKeyboardRemove,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
@@ -31,12 +32,15 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 price TEXT NOT NULL,
-                video_file_id TEXT
+                video_file_id TEXT,
+                payment_link TEXT
             )""")
         cur = await db.execute("PRAGMA table_info(courses)")
         cols = [row[1] for row in await cur.fetchall()]
         if "video_file_id" not in cols:
             await db.execute("ALTER TABLE courses ADD COLUMN video_file_id TEXT")
+        if "payment_link" not in cols:
+            await db.execute("ALTER TABLE courses ADD COLUMN payment_link TEXT")
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS purchases (
@@ -71,8 +75,9 @@ async def init_db():
         await db.commit()
 
 
-async def get_courses(page: int = 0, only_with_video: bool = True):
-    where = "WHERE video_file_id IS NOT NULL" if only_with_video else ""
+async def get_courses(page: int = 0, only_visible: bool = True):
+    where = ("WHERE video_file_id IS NOT NULL AND payment_link IS NOT NULL "
+             "AND payment_link != ''") if only_visible else ""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             f"SELECT id, name, price FROM courses {where} "
@@ -87,8 +92,8 @@ async def get_courses(page: int = 0, only_with_video: bool = True):
 async def get_course(course_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, name, price, video_file_id FROM courses WHERE id = ?",
-            (course_id,))
+            "SELECT id, name, price, video_file_id, payment_link "
+            "FROM courses WHERE id = ?", (course_id,))
         return await cur.fetchone()
 
 
@@ -128,8 +133,7 @@ async def create_pending(user_id: int, course_id: int,
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "INSERT INTO pending_purchases (user_id, course_id, receipt_file_id) "
-            "VALUES (?, ?, ?)",
-            (user_id, course_id, receipt_file_id))
+            "VALUES (?, ?, ?)", (user_id, course_id, receipt_file_id))
         await db.commit()
         return cur.lastrowid
 
@@ -149,24 +153,31 @@ async def delete_pending(pending_id: int):
 
 
 async def update_course(course_id: int, name: str, price: str,
-                        video_file_id: str | None = None):
+                        payment_link: str | None = None,
+                        video_file_id: str | None = None,
+                        change_link: bool = False,
+                        change_video: bool = False):
     async with aiosqlite.connect(DB_PATH) as db:
-        if video_file_id is None:
-            await db.execute(
-                "UPDATE courses SET name = ?, price = ? WHERE id = ?",
-                (name, price, course_id))
-        else:
-            await db.execute(
-                "UPDATE courses SET name = ?, price = ?, video_file_id = ? "
-                "WHERE id = ?", (name, price, video_file_id, course_id))
+        sets = ["name = ?", "price = ?"]
+        params = [name, price]
+        if change_link:
+            sets.append("payment_link = ?")
+            params.append(payment_link)
+        if change_video:
+            sets.append("video_file_id = ?")
+            params.append(video_file_id)
+        params.append(course_id)
+        await db.execute(f"UPDATE courses SET {', '.join(sets)} WHERE id = ?", params)
         await db.commit()
 
 
-async def create_course(name: str, price: str, video_file_id: str):
+async def create_course(name: str, price: str,
+                        payment_link: str, video_file_id: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO courses (name, price, video_file_id) VALUES (?, ?, ?)",
-            (name, price, video_file_id))
+            "INSERT INTO courses (name, price, payment_link, video_file_id) "
+            "VALUES (?, ?, ?, ?)",
+            (name, price, payment_link, video_file_id))
         await db.commit()
 
 
@@ -190,10 +201,18 @@ def main_inline_kb() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def main_reply_kb() -> ReplyKeyboardMarkup:
+def admin_reply_kb() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardBuilder()
-    kb.button(text="🏠 Главное меню")
+    kb.button(text="⚙️ Админ панель")
     return kb.as_markup(resize_keyboard=True)
+
+
+def fallback_kb(user_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🏠 Главное меню", callback_data="main_menu")
+    if user_id == ADMIN_ID:
+        kb.button(text="⚙️ Админ панель", callback_data="admin_panel")
+    return kb.as_markup()
 
 
 def courses_page_kb(page: int, total: int) -> InlineKeyboardMarkup:
@@ -214,15 +233,17 @@ def buy_course_reply_kb(courses: list) -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardBuilder()
     for i, (_, name, price) in enumerate(courses, start=1):
         kb.button(text=f"{i}. {name} — {price}")
-    kb.button(text="🏠 Главное меню")
     kb.adjust(1)
     return kb.as_markup(resize_keyboard=True, one_time_keyboard=True)
 
 
-def course_detail_inline_kb(course_id: int, page: int) -> InlineKeyboardMarkup:
+def course_detail_inline_kb(course_id: int, page: int,
+                            payment_link: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Купить", callback_data=f"buy:{course_id}:{page}")
+    kb.button(text="💳 Купить", url=payment_link)
+    kb.button(text="📸 Отправить чек", callback_data=f"receipt:{course_id}:{page}")
     kb.button(text="⬅ Назад", callback_data=f"buy_menu:{page}")
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -233,9 +254,11 @@ class AdminStates(StatesGroup):
     choose_course = State()
     enter_name = State()
     enter_price = State()
+    enter_link = State()
     enter_video = State()
     create_name = State()
     create_price = State()
+    create_link = State()
     create_video = State()
 
 
@@ -244,40 +267,53 @@ class PurchaseStates(StatesGroup):
 
 
 # ============================================================
-# ПОЛЬЗОВАТЕЛЬСКИЕ ХЕНДЛЕРЫ
+# /start
 # ============================================================
 @router.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     text = (
         "👋 Добро пожаловать!\n\n"
         "Этот бот создан для **покупки курсов**.\n"
         "Посмотрите доступные курсы, купите их и получите доступ к видео.\n\n"
-        "Выберите действие 👇"
+        "Выберите действие:"
     )
     await message.answer(text, reply_markup=main_inline_kb(), parse_mode="Markdown")
-    await message.answer("🏠 Кнопка «Главное меню» всегда внизу 👇",
-                         reply_markup=main_reply_kb())
+
+    if message.from_user.id == ADMIN_ID:
+        # просто показываем reply-клавиатуру с «⚙️ Админ панель», без подсказок
+        await message.answer("⚙️", reply_markup=admin_reply_kb())
+    else:
+        # убираем возможные старые reply-клавиатуры у пользователя
+        await message.answer("👌", reply_markup=ReplyKeyboardRemove())
 
 
+# ============================================================
+# ГЛАВНОЕ МЕНЮ (inline + ручной ввод текстом)
+# ============================================================
 @router.callback_query(F.data == "main_menu")
-async def main_menu_cb(callback: CallbackQuery):
+async def main_menu_cb(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     await safe_edit(callback.message, "🏠 Главное меню\n\nВыберите действие:",
                     main_inline_kb())
     await callback.answer()
 
 
-@router.message(F.text == "🏠 Главное меню")
+@router.message(StateFilter(None), F.text.in_({"Главное меню", "🏠 Главное меню"}))
 async def main_menu_text(message: Message):
-    await message.answer("🏠 Главное меню", reply_markup=main_reply_kb())
-    await message.answer("Выберите действие:", reply_markup=main_inline_kb())
+    await message.answer("🏠 Главное меню", reply_markup=main_inline_kb())
 
 
+# ============================================================
+# СПИСОК КУРСОВ
+# ============================================================
 @router.callback_query(F.data.startswith("courses_page:"))
 async def show_courses(callback: CallbackQuery):
     page = int(callback.data.split(":")[1])
-    courses, total = await get_courses(page)  # только с видео
+    courses, total = await get_courses(page)
     if not courses:
-        await safe_edit(callback.message, "Пока нет доступных курсов.", main_inline_kb())
+        await safe_edit(callback.message, "Пока нет доступных курсов.",
+                        main_inline_kb())
         await callback.answer()
         return
     text = "📚 Доступные курсы:\n\n" + "\n".join(
@@ -299,43 +335,61 @@ async def buy_menu(callback: CallbackQuery):
 
     back_kb = InlineKeyboardBuilder()
     back_kb.button(text="⬅ Назад", callback_data=f"courses_page:{page}")
-    await safe_edit(callback.message, "👇 Выберите курс из меню ниже:",
+    await safe_edit(callback.message, "Выберите курс из меню ниже:",
                     back_kb.as_markup())
     await callback.message.answer(
-        "Какой курс вы хотите купить?\nНажмите номер на клавиатуре ниже 👇",
+        "Какой курс вы хотите купить?\nНажмите номер на клавиатуре ниже:",
         reply_markup=buy_course_reply_kb(courses))
     await callback.answer()
 
 
-@router.message(F.text.regexp(r"^\d+\. "))
+@router.message(StateFilter(None), F.text.regexp(r"^\d+"))
 async def pick_course_reply(message: Message):
     user_id = message.from_user.id
     page = user_buy_page.get(user_id, 0)
     courses, _ = await get_courses(page)
-    try:
-        idx = int(message.text.split(".")[0]) - 1
-        course_id, name, price = courses[idx]
-    except (ValueError, IndexError):
-        await message.answer("Не удалось определить курс. Попробуйте из меню ниже.")
+    if not courses:
+        await message.answer("🤷 Я вас не понял.",
+                             reply_markup=fallback_kb(user_id))
+        return
+
+    m = re.match(r"^(\d+)", message.text or "")
+    if not m:
+        await message.answer("🤷 Я вас не понял.",
+                             reply_markup=fallback_kb(user_id))
+        return
+
+    idx = int(m.group(1)) - 1
+    if idx < 0 or idx >= len(courses):
+        await message.answer("🤷 Я вас не понял.",
+                             reply_markup=fallback_kb(user_id))
+        return
+
+    course_id, name, price = courses[idx]
+    course = await get_course(course_id)
+    if not course or not course[4]:
+        await message.answer("⚠ У этого курса нет ссылки на оплату.")
         return
 
     await message.answer(
-        f"Вы выбрали:\n\n**{name}**\nЦена: **{price}**",
-        reply_markup=course_detail_inline_kb(course_id, page),
+        f"Вы выбрали:\n\n**{name}**\nЦена: **{price}**\n\n"
+        f"1) Нажмите **💳 Купить** — откроется страница оплаты.\n"
+        f"2) После оплаты нажмите **📸 Отправить чек** и пришлите скриншот.",
+        reply_markup=course_detail_inline_kb(course_id, page, course[4]),
         parse_mode="Markdown")
-    await message.answer("🏠 Главное меню всегда доступно 👇",
-                         reply_markup=main_reply_kb())
 
 
-# ---------- КУПИТЬ → ЗАПРОС ЧЕКА ----------
-@router.callback_query(F.data.startswith("buy:"))
-async def buy_course(callback: CallbackQuery, state: FSMContext):
-    course_id = int(callback.data.split(":")[1])
+# ============================================================
+# ЧЕК
+# ============================================================
+@router.callback_query(F.data.startswith("receipt:"))
+async def start_receipt(callback: CallbackQuery, state: FSMContext):
+    _, course_id_s, _ = callback.data.split(":")
+    course_id = int(course_id_s)
     course = await get_course(course_id)
     if not course:
         await callback.answer("Курс не найден.", show_alert=True)
         return
-
     if await user_owns_course(callback.from_user.id, course_id):
         await callback.answer("У вас уже есть этот курс.", show_alert=True)
         return
@@ -345,19 +399,18 @@ async def buy_course(callback: CallbackQuery, state: FSMContext):
 
     await safe_edit(
         callback.message,
-        f"📸 Чтобы завершить покупку курса **{course[1]}** за **{course[2]}**, "
-        f"отправьте скриншот/фото чека об оплате.\n\n"
-        f"После отправки чека администратор проверит его и подтвердит покупку.\n\n"
-        f"Чтобы отменить — нажмите «🏠 Главное меню».",
+        f"📸 Отправьте скриншот/фото чека об оплате курса "
+        f"**{course[1]}** за **{course[2]}**.\n\n"
+        f"Администратор проверит чек и подтвердит покупку.",
         main_inline_kb(), parse_mode="Markdown")
     await callback.answer()
 
 
-@router.message(PurchaseStates.waiting_receipt, F.text == "🏠 Главное меню")
+@router.message(PurchaseStates.waiting_receipt,
+                F.text.in_({"Главное меню", "🏠 Главное меню"}))
 async def cancel_receipt(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Покупка отменена.", reply_markup=main_reply_kb())
-    await message.answer("Выберите действие:", reply_markup=main_inline_kb())
+    await message.answer("Покупка отменена.", reply_markup=main_inline_kb())
 
 
 @router.message(PurchaseStates.waiting_receipt, F.photo)
@@ -367,11 +420,12 @@ async def receive_receipt(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
 
     if not course_id:
-        await message.answer("Что-то пошло не так. Попробуйте снова.")
+        await message.answer("Что-то пошло не так. Попробуйте снова.",
+                             reply_markup=main_inline_kb())
         return
     course = await get_course(course_id)
     if not course:
-        await message.answer("Курс не найден.")
+        await message.answer("Курс не найден.", reply_markup=main_inline_kb())
         return
 
     receipt_file_id = message.photo[-1].file_id
@@ -384,7 +438,8 @@ async def receive_receipt(message: Message, state: FSMContext, bot: Bot):
         f"Username: @{user.username or '—'}\n"
         f"ID: {user.id}\n"
         f"Курс: {course[1]}\n"
-        f"Цена: {course[2]}")
+        f"Цена: {course[2]}\n"
+        f"Ссылка на оплату: {course[4]}")
 
     admin_kb = InlineKeyboardBuilder()
     admin_kb.button(text="✅ Подтвердить", callback_data=f"admin_confirm:{pending_id}")
@@ -396,22 +451,24 @@ async def receive_receipt(message: Message, state: FSMContext, bot: Bot):
                              reply_markup=admin_kb.as_markup())
     except Exception as e:
         await delete_pending(pending_id)
-        await message.answer(f"⚠ Не удалось отправить чек админу: {e}")
+        await message.answer(f"⚠ Не удалось отправить чек админу: {e}",
+                             reply_markup=main_inline_kb())
         return
 
-    await message.answer(
-        "✅ Чек отправлен администратору. Ожидайте подтверждения.",
-        reply_markup=main_reply_kb())
+    await message.answer("✅ Чек отправлен администратору. Ожидайте подтверждения.",
+                         reply_markup=main_inline_kb())
 
 
 @router.message(PurchaseStates.waiting_receipt)
 async def wrong_receipt(message: Message):
     await message.answer(
         "📸 Пожалуйста, отправьте именно **фото** чека об оплате "
-        "(или нажмите «🏠 Главное меню» для отмены).",
-        parse_mode="Markdown")
+        "(или «🏠 Главное меню» для отмены).", parse_mode="Markdown")
 
 
+# ============================================================
+# ВАШИ КУРСЫ
+# ============================================================
 @router.callback_query(F.data == "my_courses")
 async def my_courses(callback: CallbackQuery):
     purchases = await get_user_courses(callback.from_user.id)
@@ -447,20 +504,19 @@ async def admin_confirm(callback: CallbackQuery):
     try:
         await callback.bot.send_message(
             user_id,
-            f"✅ Покупка подтверждена!\nКурс: **{course[1]}**\n\n"
-            f"Отправляю доступ...", parse_mode="Markdown")
+            f"✅ Покупка подтверждена!\nКурс: **{course[1]}**\n\nОтправляю доступ...",
+            parse_mode="Markdown")
         if course[3]:
             await callback.bot.send_video(user_id, course[3],
                                           caption=f"Курс: {course[1]}")
         else:
             await callback.bot.send_message(
                 user_id, "⚠ Видео курса пока не загружено администратором.")
-        await callback.bot.send_message(user_id, "🏠 Главное меню 👇",
-                                        reply_markup=main_reply_kb())
+        await callback.bot.send_message(user_id, "Главное меню:",
+                                        reply_markup=main_inline_kb())
     except Exception as e:
         await callback.message.answer(f"⚠ Ошибка отправки пользователю: {e}")
 
-    # правим подпись, если сообщение с фото, иначе текст
     try:
         if callback.message.photo:
             await callback.message.edit_caption(
@@ -493,7 +549,7 @@ async def admin_reject(callback: CallbackQuery):
     try:
         await callback.bot.send_message(
             user_id, "❌ К сожалению, покупка отклонена администратором.",
-            reply_markup=main_reply_kb())
+            reply_markup=main_inline_kb())
     except Exception:
         pass
 
@@ -512,27 +568,51 @@ async def admin_reject(callback: CallbackQuery):
 
 
 # ============================================================
-# АДМИН-ПАНЕЛЬ: РЕДАКТИРОВАНИЕ
+# АДМИН-ПАНЕЛЬ
 # ============================================================
-@router.message(Command("admin"))
-async def admin_start(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ У вас нет доступа.")
-        return
-    courses, _ = await get_courses(0, only_with_video=False)
-    if not courses:
-        await message.answer("Нет курсов. Добавьте через /admin → «Добавить курс».")
-        return
+async def show_admin_panel(target: Message, state: FSMContext):
+    courses, _ = await get_courses(0, only_visible=False)
     kb = InlineKeyboardBuilder()
     for course_id, name, price in courses:
         kb.button(text=f"{name} — {price}", callback_data=f"admin_edit:{course_id}")
     kb.button(text="➕ Добавить курс", callback_data="admin_add")
     kb.adjust(1)
-    await message.answer("🛠 Выберите курс для редактирования:",
-                         reply_markup=kb.as_markup())
+    text = ("🛠 Выберите курс для редактирования:"
+            if courses else "🛠 Курсов пока нет. Добавьте первый:")
+    await target.answer(text, reply_markup=kb.as_markup())
     await state.set_state(AdminStates.choose_course)
 
 
+@router.message(F.text == "⚙️ Админ панель")
+async def admin_panel_btn(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("🤷 Я вас не понял.",
+                             reply_markup=fallback_kb(message.from_user.id))
+        return
+    await state.clear()
+    await show_admin_panel(message, state)
+
+
+@router.callback_query(F.data == "admin_panel")
+async def admin_panel_cb(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await show_admin_panel(callback.message, state)
+    await callback.answer()
+
+
+@router.message(Command("admin"))
+async def admin_start(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У вас нет доступа.")
+        return
+    await state.clear()
+    await show_admin_panel(message, state)
+
+
+# ---------- РЕДАКТИРОВАНИЕ ----------
 @router.callback_query(F.data.startswith("admin_edit:"), AdminStates.choose_course)
 async def admin_choose_course(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
@@ -547,14 +627,35 @@ async def admin_choose_course(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminStates.enter_name)
 async def admin_enter_name(message: Message, state: FSMContext):
-    await state.update_data(new_name=message.text.strip())
+    await state.update_data(new_name=(message.text or "").strip())
     await message.answer("Введите новую **цену** курса:")
     await state.set_state(AdminStates.enter_price)
 
 
 @router.message(AdminStates.enter_price)
 async def admin_enter_price(message: Message, state: FSMContext):
-    await state.update_data(new_price=message.text.strip())
+    await state.update_data(new_price=(message.text or "").strip())
+    await message.answer(
+        "Отправьте новую **ссылку на оплату** (http:// или https://) "
+        "или /skip, чтобы оставить текущую.")
+    await state.set_state(AdminStates.enter_link)
+
+
+@router.message(AdminStates.enter_link, Command("skip"))
+async def admin_skip_link(message: Message, state: FSMContext):
+    await state.update_data(new_link=None, change_link=False)
+    await message.answer(
+        "Отправьте **новое видео** курса или /skip, чтобы оставить старое.")
+    await state.set_state(AdminStates.enter_video)
+
+
+@router.message(AdminStates.enter_link)
+async def admin_enter_link(message: Message, state: FSMContext):
+    link = (message.text or "").strip()
+    if not link.startswith(("http://", "https://")):
+        await message.answer("⚠ Ссылка должна начинаться с http:// или https://")
+        return
+    await state.update_data(new_link=link, change_link=True)
     await message.answer(
         "Отправьте **новое видео** курса или /skip, чтобы оставить старое.")
     await state.set_state(AdminStates.enter_video)
@@ -563,7 +664,11 @@ async def admin_enter_price(message: Message, state: FSMContext):
 @router.message(AdminStates.enter_video, Command("skip"))
 async def admin_skip_video(message: Message, state: FSMContext):
     data = await state.get_data()
-    await update_course(data["course_id"], data["new_name"], data["new_price"])
+    await update_course(
+        data["course_id"], data["new_name"], data["new_price"],
+        payment_link=data.get("new_link"),
+        change_link=data.get("change_link", False),
+        change_video=False)
     await state.clear()
     await message.answer("✅ Курс обновлён (видео без изменений).",
                          reply_markup=main_inline_kb())
@@ -572,8 +677,12 @@ async def admin_skip_video(message: Message, state: FSMContext):
 @router.message(AdminStates.enter_video, F.video)
 async def admin_enter_video(message: Message, state: FSMContext):
     data = await state.get_data()
-    await update_course(data["course_id"], data["new_name"],
-                        data["new_price"], message.video.file_id)
+    await update_course(
+        data["course_id"], data["new_name"], data["new_price"],
+        payment_link=data.get("new_link"),
+        video_file_id=message.video.file_id,
+        change_link=data.get("change_link", False),
+        change_video=True)
     await state.clear()
     await message.answer("✅ Курс обновлён (видео заменено).",
                          reply_markup=main_inline_kb())
@@ -584,9 +693,7 @@ async def admin_enter_video_invalid(message: Message):
     await message.answer("Отправьте видео или /skip.")
 
 
-# ============================================================
-# АДМИН-ПАНЕЛЬ: ДОБАВЛЕНИЕ
-# ============================================================
+# ---------- ДОБАВЛЕНИЕ ----------
 @router.callback_query(F.data == "admin_add")
 async def admin_add_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
@@ -599,14 +706,25 @@ async def admin_add_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminStates.create_name)
 async def admin_create_name(message: Message, state: FSMContext):
-    await state.update_data(create_name=message.text.strip())
+    await state.update_data(create_name=(message.text or "").strip())
     await message.answer("Введите **цену** нового курса:")
     await state.set_state(AdminStates.create_price)
 
 
 @router.message(AdminStates.create_price)
 async def admin_create_price(message: Message, state: FSMContext):
-    await state.update_data(create_price=message.text.strip())
+    await state.update_data(create_price=(message.text or "").strip())
+    await message.answer("Отправьте **ссылку на оплату** (http:// или https://):")
+    await state.set_state(AdminStates.create_link)
+
+
+@router.message(AdminStates.create_link)
+async def admin_create_link(message: Message, state: FSMContext):
+    link = (message.text or "").strip()
+    if not link.startswith(("http://", "https://")):
+        await message.answer("⚠ Ссылка должна начинаться с http:// или https://")
+        return
+    await state.update_data(create_link=link)
     await message.answer("Отправьте **видео** нового курса:")
     await state.set_state(AdminStates.create_video)
 
@@ -615,10 +733,10 @@ async def admin_create_price(message: Message, state: FSMContext):
 async def admin_create_video(message: Message, state: FSMContext):
     data = await state.get_data()
     await create_course(data["create_name"], data["create_price"],
-                        message.video.file_id)
+                        data["create_link"], message.video.file_id)
     await state.clear()
     await message.answer(
-        "✅ Новый курс добавлен вместе с видео.\n\n"
+        "✅ Новый курс добавлен вместе с видео и ссылкой на оплату.\n\n"
         "Его уже видят пользователи в разделе «Курсы».",
         reply_markup=main_inline_kb())
 
@@ -627,6 +745,15 @@ async def admin_create_video(message: Message, state: FSMContext):
 async def admin_create_video_invalid(message: Message):
     await message.answer("⚠ Нужно отправить именно **видео** файлом.",
                          parse_mode="Markdown")
+
+
+# ============================================================
+# CATCH-ALL (я вас не понял)
+# ============================================================
+@router.message(StateFilter(None))
+async def fallback_message(message: Message):
+    await message.answer("🤷 Я вас не понял.",
+                         reply_markup=fallback_kb(message.from_user.id))
 
 
 # ============================================================
