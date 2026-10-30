@@ -1,6 +1,6 @@
 import asyncio
-import os
 import aiosqlite
+import os
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -33,7 +33,6 @@ async def init_db():
                 price TEXT NOT NULL,
                 video_file_id TEXT
             )""")
-        # авто-миграция старых баз
         cur = await db.execute("PRAGMA table_info(courses)")
         cols = [row[1] for row in await cur.fetchall()]
         if "video_file_id" not in cols:
@@ -49,8 +48,13 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS pending_purchases (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
-                course_id INTEGER NOT NULL
+                course_id INTEGER NOT NULL,
+                receipt_file_id TEXT
             )""")
+        cur = await db.execute("PRAGMA table_info(pending_purchases)")
+        cols = [row[1] for row in await cur.fetchall()]
+        if "receipt_file_id" not in cols:
+            await db.execute("ALTER TABLE pending_purchases ADD COLUMN receipt_file_id TEXT")
 
         cur = await db.execute("SELECT COUNT(*) FROM courses")
         if (await cur.fetchone())[0] == 0:
@@ -67,13 +71,15 @@ async def init_db():
         await db.commit()
 
 
-async def get_courses(page: int = 0):
+async def get_courses(page: int = 0, only_with_video: bool = True):
+    where = "WHERE video_file_id IS NOT NULL" if only_with_video else ""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, name, price FROM courses ORDER BY id LIMIT ? OFFSET ?",
+            f"SELECT id, name, price FROM courses {where} "
+            f"ORDER BY id LIMIT ? OFFSET ?",
             (PAGE_SIZE, page * PAGE_SIZE))
         rows = await cur.fetchall()
-        cur = await db.execute("SELECT COUNT(*) FROM courses")
+        cur = await db.execute(f"SELECT COUNT(*) FROM courses {where}")
         total = (await cur.fetchone())[0]
     return rows, total
 
@@ -95,6 +101,14 @@ async def get_user_courses(user_id: int):
         return await cur.fetchall()
 
 
+async def user_owns_course(user_id: int, course_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id FROM purchases WHERE user_id = ? AND course_id = ?",
+            (user_id, course_id))
+        return await cur.fetchone() is not None
+
+
 async def add_purchase(user_id: int, course_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -109,11 +123,13 @@ async def add_purchase(user_id: int, course_id: int) -> bool:
         return False
 
 
-async def create_pending(user_id: int, course_id: int) -> int:
+async def create_pending(user_id: int, course_id: int,
+                         receipt_file_id: str | None = None) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "INSERT INTO pending_purchases (user_id, course_id) VALUES (?, ?)",
-            (user_id, course_id))
+            "INSERT INTO pending_purchases (user_id, course_id, receipt_file_id) "
+            "VALUES (?, ?, ?)",
+            (user_id, course_id, receipt_file_id))
         await db.commit()
         return cur.lastrowid
 
@@ -121,8 +137,8 @@ async def create_pending(user_id: int, course_id: int) -> int:
 async def get_pending(pending_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, user_id, course_id FROM pending_purchases WHERE id = ?",
-            (pending_id,))
+            "SELECT id, user_id, course_id, receipt_file_id "
+            "FROM pending_purchases WHERE id = ?", (pending_id,))
         return await cur.fetchone()
 
 
@@ -141,8 +157,8 @@ async def update_course(course_id: int, name: str, price: str,
                 (name, price, course_id))
         else:
             await db.execute(
-                "UPDATE courses SET name = ?, price = ?, video_file_id = ? WHERE id = ?",
-                (name, price, video_file_id, course_id))
+                "UPDATE courses SET name = ?, price = ?, video_file_id = ? "
+                "WHERE id = ?", (name, price, video_file_id, course_id))
         await db.commit()
 
 
@@ -211,16 +227,20 @@ def course_detail_inline_kb(course_id: int, page: int) -> InlineKeyboardMarkup:
 
 
 # ============================================================
-# СОСТОЯНИЯ АДМИНА
+# СОСТОЯНИЯ
 # ============================================================
 class AdminStates(StatesGroup):
     choose_course = State()
     enter_name = State()
     enter_price = State()
-    enter_video = State()      # замена видео у существующего
+    enter_video = State()
     create_name = State()
     create_price = State()
-    create_video = State()     # видео при создании
+    create_video = State()
+
+
+class PurchaseStates(StatesGroup):
+    waiting_receipt = State()
 
 
 # ============================================================
@@ -255,7 +275,7 @@ async def main_menu_text(message: Message):
 @router.callback_query(F.data.startswith("courses_page:"))
 async def show_courses(callback: CallbackQuery):
     page = int(callback.data.split(":")[1])
-    courses, total = await get_courses(page)
+    courses, total = await get_courses(page)  # только с видео
     if not courses:
         await safe_edit(callback.message, "Пока нет доступных курсов.", main_inline_kb())
         await callback.answer()
@@ -307,22 +327,58 @@ async def pick_course_reply(message: Message):
                          reply_markup=main_reply_kb())
 
 
+# ---------- КУПИТЬ → ЗАПРОС ЧЕКА ----------
 @router.callback_query(F.data.startswith("buy:"))
-async def buy_course(callback: CallbackQuery):
+async def buy_course(callback: CallbackQuery, state: FSMContext):
     course_id = int(callback.data.split(":")[1])
     course = await get_course(course_id)
     if not course:
         await callback.answer("Курс не найден.", show_alert=True)
         return
 
-    user = callback.from_user
-    pending_id = await create_pending(user.id, course_id)
+    if await user_owns_course(callback.from_user.id, course_id):
+        await callback.answer("У вас уже есть этот курс.", show_alert=True)
+        return
 
-    admin_kb = InlineKeyboardBuilder()
-    admin_kb.button(text="✅ Подтвердить", callback_data=f"admin_confirm:{pending_id}")
-    admin_kb.button(text="❌ Отклонить", callback_data=f"admin_reject:{pending_id}")
+    await state.update_data(buy_course_id=course_id)
+    await state.set_state(PurchaseStates.waiting_receipt)
 
-    admin_text = (
+    await safe_edit(
+        callback.message,
+        f"📸 Чтобы завершить покупку курса **{course[1]}** за **{course[2]}**, "
+        f"отправьте скриншот/фото чека об оплате.\n\n"
+        f"После отправки чека администратор проверит его и подтвердит покупку.\n\n"
+        f"Чтобы отменить — нажмите «🏠 Главное меню».",
+        main_inline_kb(), parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.message(PurchaseStates.waiting_receipt, F.text == "🏠 Главное меню")
+async def cancel_receipt(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Покупка отменена.", reply_markup=main_reply_kb())
+    await message.answer("Выберите действие:", reply_markup=main_inline_kb())
+
+
+@router.message(PurchaseStates.waiting_receipt, F.photo)
+async def receive_receipt(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    course_id = data.get("buy_course_id")
+    await state.clear()
+
+    if not course_id:
+        await message.answer("Что-то пошло не так. Попробуйте снова.")
+        return
+    course = await get_course(course_id)
+    if not course:
+        await message.answer("Курс не найден.")
+        return
+
+    receipt_file_id = message.photo[-1].file_id
+    pending_id = await create_pending(message.from_user.id, course_id, receipt_file_id)
+
+    user = message.from_user
+    info = (
         f"🛒 Новый запрос на покупку\n\n"
         f"Пользователь: {user.full_name}\n"
         f"Username: @{user.username or '—'}\n"
@@ -330,18 +386,30 @@ async def buy_course(callback: CallbackQuery):
         f"Курс: {course[1]}\n"
         f"Цена: {course[2]}")
 
+    admin_kb = InlineKeyboardBuilder()
+    admin_kb.button(text="✅ Подтвердить", callback_data=f"admin_confirm:{pending_id}")
+    admin_kb.button(text="❌ Отклонить", callback_data=f"admin_reject:{pending_id}")
+
     try:
-        await callback.bot.send_message(ADMIN_ID, admin_text,
-                                        reply_markup=admin_kb.as_markup())
+        await bot.send_photo(ADMIN_ID, receipt_file_id,
+                             caption=info,
+                             reply_markup=admin_kb.as_markup())
     except Exception as e:
         await delete_pending(pending_id)
-        await callback.answer(f"Не удалось отправить админу: {e}", show_alert=True)
+        await message.answer(f"⚠ Не удалось отправить чек админу: {e}")
         return
 
-    await safe_edit(callback.message,
-                    "⏳ Запрос отправлен администратору. Ожидайте подтверждения.",
-                    main_inline_kb())
-    await callback.answer("Запрос отправлен")
+    await message.answer(
+        "✅ Чек отправлен администратору. Ожидайте подтверждения.",
+        reply_markup=main_reply_kb())
+
+
+@router.message(PurchaseStates.waiting_receipt)
+async def wrong_receipt(message: Message):
+    await message.answer(
+        "📸 Пожалуйста, отправьте именно **фото** чека об оплате "
+        "(или нажмите «🏠 Главное меню» для отмены).",
+        parse_mode="Markdown")
 
 
 @router.callback_query(F.data == "my_courses")
@@ -371,17 +439,17 @@ async def admin_confirm(callback: CallbackQuery):
         await callback.answer("Запрос не найден или уже обработан.", show_alert=True)
         return
 
-    _, user_id, course_id = pending
-    course = await get_course(course_id)  # id, name, price, video_file_id
+    _, user_id, course_id, _ = pending
+    course = await get_course(course_id)
     await add_purchase(user_id, course_id)
     await delete_pending(pending_id)
 
     try:
         await callback.bot.send_message(
             user_id,
-            f"✅ Покупка подтверждена!\nКурс: **{course[1]}**\n\nОтправляю доступ...",
-            parse_mode="Markdown")
-        if course[3]:  # video_file_id
+            f"✅ Покупка подтверждена!\nКурс: **{course[1]}**\n\n"
+            f"Отправляю доступ...", parse_mode="Markdown")
+        if course[3]:
             await callback.bot.send_video(user_id, course[3],
                                           caption=f"Курс: {course[1]}")
         else:
@@ -392,8 +460,16 @@ async def admin_confirm(callback: CallbackQuery):
     except Exception as e:
         await callback.message.answer(f"⚠ Ошибка отправки пользователю: {e}")
 
+    # правим подпись, если сообщение с фото, иначе текст
     try:
-        await callback.message.edit_text(callback.message.text + "\n\n✅ Подтверждено")
+        if callback.message.photo:
+            await callback.message.edit_caption(
+                caption=(callback.message.caption or "") + "\n\n✅ Подтверждено",
+                reply_markup=None)
+        else:
+            await callback.message.edit_text(
+                (callback.message.text or "") + "\n\n✅ Подтверждено",
+                reply_markup=None)
     except TelegramBadRequest:
         pass
     await callback.answer("Подтверждено")
@@ -411,7 +487,7 @@ async def admin_reject(callback: CallbackQuery):
         await callback.answer("Запрос не найден.", show_alert=True)
         return
 
-    _, user_id, _ = pending
+    _, user_id, _, _ = pending
     await delete_pending(pending_id)
 
     try:
@@ -422,7 +498,14 @@ async def admin_reject(callback: CallbackQuery):
         pass
 
     try:
-        await callback.message.edit_text(callback.message.text + "\n\n❌ Отклонено")
+        if callback.message.photo:
+            await callback.message.edit_caption(
+                caption=(callback.message.caption or "") + "\n\n❌ Отклонено",
+                reply_markup=None)
+        else:
+            await callback.message.edit_text(
+                (callback.message.text or "") + "\n\n❌ Отклонено",
+                reply_markup=None)
     except TelegramBadRequest:
         pass
     await callback.answer("Отклонено")
@@ -436,7 +519,7 @@ async def admin_start(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         await message.answer("⛔ У вас нет доступа.")
         return
-    courses, _ = await get_courses(0)
+    courses, _ = await get_courses(0, only_with_video=False)
     if not courses:
         await message.answer("Нет курсов. Добавьте через /admin → «Добавить курс».")
         return
@@ -542,7 +625,7 @@ async def admin_create_video(message: Message, state: FSMContext):
 
 @router.message(AdminStates.create_video)
 async def admin_create_video_invalid(message: Message):
-    await message.answer("⚠ Нужно отправить именно **видео** файлом.", 
+    await message.answer("⚠ Нужно отправить именно **видео** файлом.",
                          parse_mode="Markdown")
 
 
