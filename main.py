@@ -3,7 +3,7 @@ import os
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile
 
-TOKEN = os.getenv("TG_TOKEN")
+TOKEN = os.getenv("TOKEN")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -11,7 +11,7 @@ dp = Dispatcher()
 @dp.message(F.text == '/start')
 async def send_video_handler(message: Message):
     # Путь к локальному видеофайлу
-    video_file = FSInputFile("path/to/video.mp4")
+    video_file = FSInputFile("video.mp4")
     await message.answer_video(
         video=video_file,
         caption="Вот ваше видео!"
