@@ -1,27 +1,29 @@
 import asyncio
-import os
 import aiosqlite
+import os
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton,
+    FSInputFile,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest
 
 BOT_TOKEN = os.getenv("TOKEN")
-ADMIN_ID = 6113518001  # замените на ваш Telegram ID
-
+ADMIN_ID = 6113518001        # ваш Telegram ID
 DB_PATH = "courses.db"
+VIDEO_PATH = "video.mp4"      # временное решение — одно видео для всех
 PAGE_SIZE = 5
 
 router = Router()
+
+# текущая страница списка курсов для каждого пользователя (нужна для reply-кнопок)
+user_buy_page: dict[int, int] = {}
 
 # ============================================================
 # БАЗА ДАННЫХ
@@ -33,20 +35,22 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 price TEXT NOT NULL
-            )
-        """)
+            )""")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS purchases (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 course_id INTEGER NOT NULL,
                 FOREIGN KEY (course_id) REFERENCES courses(id)
-            )
-        """)
-        # демо-курсы для первого запуска
+            )""")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS pending_purchases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                course_id INTEGER NOT NULL
+            )""")
         cursor = await db.execute("SELECT COUNT(*) FROM courses")
-        count = (await cursor.fetchone())[0]
-        if count == 0:
+        if (await cursor.fetchone())[0] == 0:
             demo = [
                 ("Python с нуля", "4 900 ₽"),
                 ("Telegram-боты на aiogram 3", "6 900 ₽"),
@@ -55,80 +59,97 @@ async def init_db():
                 ("Docker и CI/CD", "5 900 ₽"),
                 ("Алгоритмы и структуры данных", "8 900 ₽"),
             ]
-            await db.executemany(
-                "INSERT INTO courses (name, price) VALUES (?, ?)", demo
-            )
+            await db.executemany("INSERT INTO courses (name, price) VALUES (?, ?)", demo)
         await db.commit()
 
 
 async def get_courses(page: int = 0):
-    offset = page * PAGE_SIZE
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
+        cur = await db.execute(
             "SELECT id, name, price FROM courses ORDER BY id LIMIT ? OFFSET ?",
-            (PAGE_SIZE, offset),
-        )
-        rows = await cursor.fetchall()
-        cursor = await db.execute("SELECT COUNT(*) FROM courses")
-        total = (await cursor.fetchone())[0]
+            (PAGE_SIZE, page * PAGE_SIZE))
+        rows = await cur.fetchall()
+        cur = await db.execute("SELECT COUNT(*) FROM courses")
+        total = (await cur.fetchone())[0]
     return rows, total
 
 
-async def get_course_by_id(course_id: int):
+async def get_course(course_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT id, name, price FROM courses WHERE id = ?", (course_id,)
-        )
-        return await cursor.fetchone()
+        cur = await db.execute(
+            "SELECT id, name, price FROM courses WHERE id = ?", (course_id,))
+        return await cur.fetchone()
 
 
 async def get_user_courses(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            """
-            SELECT c.name, c.price
-            FROM purchases p
+        cur = await db.execute("""
+            SELECT c.name, c.price FROM purchases p
             JOIN courses c ON c.id = p.course_id
-            WHERE p.user_id = ?
-            ORDER BY p.id DESC
-            """,
-            (user_id,),
-        )
-        return await cursor.fetchall()
+            WHERE p.user_id = ? ORDER BY p.id DESC""", (user_id,))
+        return await cur.fetchall()
 
 
-async def add_purchase(user_id: int, course_id: int):
+async def add_purchase(user_id: int, course_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
-        # защита от повторной покупки
-        cursor = await db.execute(
+        cur = await db.execute(
             "SELECT id FROM purchases WHERE user_id = ? AND course_id = ?",
-            (user_id, course_id),
-        )
-        if await cursor.fetchone() is None:
+            (user_id, course_id))
+        if await cur.fetchone() is None:
             await db.execute(
                 "INSERT INTO purchases (user_id, course_id) VALUES (?, ?)",
-                (user_id, course_id),
-            )
+                (user_id, course_id))
             await db.commit()
             return True
         return False
+
+
+async def create_pending(user_id: int, course_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO pending_purchases (user_id, course_id) VALUES (?, ?)",
+            (user_id, course_id))
+        await db.commit()
+        return cur.lastrowid
+
+
+async def get_pending(pending_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id, user_id, course_id FROM pending_purchases WHERE id = ?",
+            (pending_id,))
+        return await cur.fetchone()
+
+
+async def delete_pending(pending_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM pending_purchases WHERE id = ?", (pending_id,))
+        await db.commit()
 
 
 async def update_course(course_id: int, name: str, price: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE courses SET name = ?, price = ? WHERE id = ?",
-            (name, price, course_id),
-        )
+            (name, price, course_id))
         await db.commit()
 
 
 async def create_course(name: str, price: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO courses (name, price) VALUES (?, ?)", (name, price)
-        )
+            "INSERT INTO courses (name, price) VALUES (?, ?)", (name, price))
         await db.commit()
+
+
+# ============================================================
+# УТИЛИТА БЕЗОПАСНОГО РЕДАКТИРОВАНИЯ
+# ============================================================
+async def safe_edit(message: Message, text: str, reply_markup=None, parse_mode=None):
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except TelegramBadRequest:
+        pass
 
 
 # ============================================================
@@ -141,53 +162,49 @@ def main_inline_kb() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+def main_reply_kb() -> ReplyKeyboardMarkup:
+    """Главное меню — всегда текстовая кнопка."""
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="🏠 Главное меню")
+    return kb.as_markup(resize_keyboard=True)
+
+
 def courses_page_kb(page: int, total: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
 
-    # кнопки листания, только если страниц больше одной
-    if total_pages > 1:
-        if page > 0:
-            kb.button(text="⬅ Назад", callback_data=f"courses_page:{page - 1}")
-        if page < total_pages - 1:
-            kb.button(text="Вперёд ➡", callback_data=f"courses_page:{page + 1}")
+    # назад — предыдущая страница или в главное меню
+    if page > 0:
+        kb.button(text="⬅ Назад", callback_data=f"courses_page:{page - 1}")
+    else:
+        kb.button(text="⬅ Назад", callback_data="main_menu")
 
-    # кнопка «Купить курсы» под списком
-    kb.row(InlineKeyboardButton(text="🛒 Купить курсы", callback_data="buy_menu"))
+    if page < total_pages - 1:
+        kb.button(text="Вперёд ➡", callback_data=f"courses_page:{page + 1}")
 
-    # кнопка «Главное меню» (inline — чтобы можно было вернуться из любого места)
-    kb.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu"))
-
+    kb.row(InlineKeyboardButton(text="🛒 Купить курсы", callback_data=f"buy_menu:{page}"))
     return kb.as_markup()
 
 
 def buy_course_reply_kb(courses: list) -> ReplyKeyboardMarkup:
-    """Обычные кнопки от 1 до 5 + Главное меню."""
+    """Обычные кнопки 1..5 + Главное меню."""
     kb = ReplyKeyboardBuilder()
-    for i, (course_id, name, price) in enumerate(courses, start=1):
+    for i, (_, name, price) in enumerate(courses, start=1):
         kb.button(text=f"{i}. {name} — {price}")
     kb.button(text="🏠 Главное меню")
     kb.adjust(1)
     return kb.as_markup(resize_keyboard=True, one_time_keyboard=True)
 
 
-def course_detail_inline_kb(course_id: int) -> InlineKeyboardMarkup:
+def course_detail_inline_kb(course_id: int, page: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Купить", callback_data=f"buy:{course_id}")
-    kb.button(text="🔗 Ссылка на курс", callback_data=f"link:{course_id}")
-    kb.button(text="⬅ Назад", callback_data="courses_page:0")
+    kb.button(text="✅ Купить", callback_data=f"buy:{course_id}:{page}")
+    kb.button(text="⬅ Назад", callback_data=f"buy_menu:{page}")
     return kb.as_markup()
 
 
-def main_reply_kb() -> ReplyKeyboardMarkup:
-    kb = ReplyKeyboardBuilder()
-    kb.button(text="🏠 Главное меню")
-    kb.adjust(1)
-    return kb.as_markup(resize_keyboard=True, one_time_keyboard=True)
-
-
 # ============================================================
-# СОСТОЯНИЯ ДЛЯ АДМИН-ПАНЕЛИ
+# СОСТОЯНИЯ АДМИНА
 # ============================================================
 class AdminStates(StatesGroup):
     choose_course = State()
@@ -198,195 +215,238 @@ class AdminStates(StatesGroup):
 
 
 # ============================================================
-# ХЕНДЛЕРЫ ПОЛЬЗОВАТЕЛЯ
+# ПОЛЬЗОВАТЕЛЬСКИЕ ХЕНДЛЕРЫ
 # ============================================================
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     text = (
         "👋 Добро пожаловать!\n\n"
         "Этот бот создан для **покупки курсов**.\n"
-        "Здесь вы можете посмотреть доступные курсы, "
-        "приобрести их и получить доступ к уже купленным материалам.\n\n"
+        "Здесь вы можете посмотреть доступные курсы, приобрести их "
+        "и получить доступ к уже купленным материалам.\n\n"
         "Выберите действие ниже 👇"
     )
-    await message.answer(
-        text, reply_markup=main_inline_kb(), parse_mode="Markdown"
-    )
+    await message.answer(text, reply_markup=main_inline_kb(), parse_mode="Markdown")
+    await message.answer("🏠 Кнопка «Главное меню» всегда внизу 👇",
+                         reply_markup=main_reply_kb())
 
 
 @router.callback_query(F.data == "main_menu")
 async def main_menu_cb(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "🏠 Главное меню\n\nВыберите действие:",
-        reply_markup=main_inline_kb(),
-    )
+    await safe_edit(callback.message, "🏠 Главное меню\n\nВыберите действие:",
+                    main_inline_kb())
     await callback.answer()
 
 
 @router.message(F.text == "🏠 Главное меню")
-async def main_menu_reply(message: Message):
-    await message.answer(
-        "🏠 Главное меню", reply_markup=main_inline_kb()
-    )
+async def main_menu_text(message: Message):
+    await message.answer("🏠 Главное меню", reply_markup=main_reply_kb())
+    await message.answer("Выберите действие:", reply_markup=main_inline_kb())
 
 
-# ---------- СПИСОК КУРСОВ С ПАГИНАЦИЕЙ ----------
+# ---------- СПИСОК КУРСОВ ----------
 @router.callback_query(F.data.startswith("courses_page:"))
 async def show_courses(callback: CallbackQuery):
     page = int(callback.data.split(":")[1])
     courses, total = await get_courses(page)
-
     if not courses:
-        await callback.message.edit_text(
-            "Пока нет доступных курсов.",
-            reply_markup=main_inline_kb(),
-        )
+        await safe_edit(callback.message, "Пока нет доступных курсов.", main_inline_kb())
         await callback.answer()
         return
-
-    text = "📚 Доступные курсы:\n\n"
-    for course_id, name, price in courses:
-        text += f"• **{name}** — {price}\n"
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=courses_page_kb(page, total),
-        parse_mode="Markdown",
-    )
+    text = "📚 Доступные курсы:\n\n" + "\n".join(
+        f"• **{name}** — {price}" for _, name, price in courses)
+    await safe_edit(callback.message, text,
+                    courses_page_kb(page, total), parse_mode="Markdown")
     await callback.answer()
 
 
-# ---------- КУПИТЬ КУРСЫ: ОБЫЧНЫЕ КНОПКИ 1–5 ----------
-@router.callback_query(F.data == "buy_menu")
+# ---------- МЕНЮ ПОКУПКИ (REPLY-КНОПКИ) ----------
+@router.callback_query(F.data.startswith("buy_menu:"))
 async def buy_menu(callback: CallbackQuery):
-    courses, _ = await get_courses(0)  # показываем первые 5
+    page = int(callback.data.split(":")[1])
+    courses, _ = await get_courses(page)
     if not courses:
-        await callback.message.edit_text(
-            "Курсы ещё не добавлены.", reply_markup=main_inline_kb()
-        )
+        await safe_edit(callback.message, "Курсы не найдены.", main_inline_kb())
         await callback.answer()
         return
 
-    text = (
-        "Какой курс вы хотите купить?\n"
-        "Нажмите на соответствующую кнопку ниже 👇"
-    )
-    await callback.message.edit_text(text, reply_markup=main_inline_kb())  # убираем inline-список
+    user_buy_page[callback.from_user.id] = page
+
+    back_kb = InlineKeyboardBuilder()
+    back_kb.button(text="⬅ Назад", callback_data=f"courses_page:{page}")
+    await safe_edit(callback.message,
+                    "👇 Выберите курс из меню ниже:",
+                    back_kb.as_markup())
+
     await callback.message.answer(
-        "Выберите курс:",
-        reply_markup=buy_course_reply_kb(courses),
-    )
+        "Какой курс вы хотите купить?\nНажмите номер на клавиатуре ниже 👇",
+        reply_markup=buy_course_reply_kb(courses))
     await callback.answer()
 
 
-# Обработка обычных кнопок «1. Курс — цена»
-@router.message(F.text.regexp(r"^\d+\. .+ — .+$"))
+# ---------- ВЫБОР КУРСА ЧЕРЕЗ REPLY (1..5) ----------
+@router.message(F.text.regexp(r"^\d+\. "))
 async def pick_course_reply(message: Message):
-    text = message.text
-    # вытаскиваем название курса между «1. » и « — »
-    name = text.split(". ", 1)[1].rsplit(" — ", 1)[0]
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT id, name, price FROM courses WHERE name = ?", (name,)
-        )
-        course = await cursor.fetchone()
-
-    if not course:
-        await message.answer("Курс не найден. Попробуйте снова.")
+    user_id = message.from_user.id
+    page = user_buy_page.get(user_id, 0)
+    courses, _ = await get_courses(page)
+    try:
+        idx = int(message.text.split(".")[0]) - 1
+        course_id, name, price = courses[idx]
+    except (ValueError, IndexError):
+        await message.answer("Не удалось определить курс. Попробуйте из меню ниже.")
         return
 
-    course_id, name, price = course
     await message.answer(
-        f"Вы выбрали:\n\n"
-        f"**{name}**\n"
-        f"Цена: **{price}**",
-        reply_markup=course_detail_inline_kb(course_id),
-        parse_mode="Markdown",
-    )
-    await message.answer(
-        "Для возврата в меню используйте кнопку ниже.",
-        reply_markup=main_reply_kb(),
-    )
+        f"Вы выбрали:\n\n**{name}**\nЦена: **{price}**",
+        reply_markup=course_detail_inline_kb(course_id, page),
+        parse_mode="Markdown")
+    # возвращаем reply-клавиатуру к виду «только Главное меню»
+    await message.answer("🏠 Главное меню всегда доступно 👇", reply_markup=main_reply_kb())
 
 
-# ---------- ДЕТАЛИ КУРСА: КУПИТЬ / ССЫЛКА / НАЗАД ----------
+# ---------- КУПИТЬ КУРС → ЗАПРОС АДМИНУ ----------
 @router.callback_query(F.data.startswith("buy:"))
 async def buy_course(callback: CallbackQuery):
-    course_id = int(callback.data.split(":")[1])
-    course = await get_course_by_id(course_id)
+    parts = callback.data.split(":")
+    course_id = int(parts[1])
+    course = await get_course(course_id)
     if not course:
         await callback.answer("Курс не найден.", show_alert=True)
         return
 
-    _, name, price = course
-    added = await add_purchase(callback.from_user.id, course_id)
-    if added:
-        await callback.message.edit_text(
-            f"✅ Вы успешно приобрели курс **{name}** за **{price}**!\n\n"
-            f"Курс добавлен в раздел «Ваши курсы».",
-            reply_markup=main_inline_kb(),
-            parse_mode="Markdown",
-        )
-    else:
-        await callback.message.edit_text(
-            f"У вас уже есть курс **{name}**.",
-            reply_markup=main_inline_kb(),
-            parse_mode="Markdown",
-        )
-    await callback.answer()
+    user = callback.from_user
+    pending_id = await create_pending(user.id, course_id)
 
+    admin_kb = InlineKeyboardBuilder()
+    admin_kb.button(text="✅ Подтвердить", callback_data=f"admin_confirm:{pending_id}")
+    admin_kb.button(text="❌ Отклонить", callback_data=f"admin_reject:{pending_id}")
 
-@router.callback_query(F.data.startswith("link:"))
-async def course_link(callback: CallbackQuery):
-    course_id = int(callback.data.split(":")[1])
-    course = await get_course_by_id(course_id)
-    if course:
-        await callback.message.answer(
-            f"🔗 Ссылка на курс «{course[1]}»: https://example.com/course/{course_id}"
-        )
-    await callback.answer()
+    admin_text = (
+        f"🛒 Новый запрос на покупку\n\n"
+        f"Пользователь: {user.full_name}\n"
+        f"Username: @{user.username or '—'}\n"
+        f"ID: {user.id}\n"
+        f"Курс: {course[1]}\n"
+        f"Цена: {course[2]}")
+
+    try:
+        await callback.bot.send_message(ADMIN_ID, admin_text,
+                                        reply_markup=admin_kb.as_markup())
+    except Exception as e:
+        await delete_pending(pending_id)
+        await callback.answer(f"Не удалось отправить админу: {e}", show_alert=True)
+        return
+
+    await safe_edit(callback.message,
+                    "⏳ Запрос отправлен администратору. Ожидайте подтверждения.",
+                    main_inline_kb())
+    await callback.answer("Запрос отправлен")
 
 
 # ---------- ВАШИ КУРСЫ ----------
 @router.callback_query(F.data == "my_courses")
 async def my_courses(callback: CallbackQuery):
     purchases = await get_user_courses(callback.from_user.id)
-    if not purchases:
-        text = "У вас пока нет приобретённых курсов."
-    else:
-        text = "🎓 Ваши курсы:\n\n"
-        for name, price in purchases:
-            text += f"• **{name}** — {price}\n"
-    await callback.message.edit_text(
-        text, reply_markup=main_inline_kb(), parse_mode="Markdown"
-    )
+    text = ("У вас пока нет приобретённых курсов."
+            if not purchases else
+            "🎓 Ваши курсы:\n\n" + "\n".join(f"• **{n}** — {p}" for n, p in purchases))
+    back_kb = InlineKeyboardBuilder()
+    back_kb.button(text="⬅ Назад", callback_data="main_menu")
+    await safe_edit(callback.message, text, back_kb.as_markup(), parse_mode="Markdown")
     await callback.answer()
 
 
 # ============================================================
-# АДМИН-ПАНЕЛЬ (ИЗМЕНЕНИЕ КУРСОВ)
+# АДМИН: ПОДТВЕРЖДЕНИЕ / ОТКЛОНЕНИЕ
+# ============================================================
+@router.callback_query(F.data.startswith("admin_confirm:"))
+async def admin_confirm(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    pending_id = int(callback.data.split(":")[1])
+    pending = await get_pending(pending_id)
+    if not pending:
+        await callback.answer("Запрос не найден или уже обработан.", show_alert=True)
+        return
+
+    _, user_id, course_id = pending
+    course = await get_course(course_id)
+    await add_purchase(user_id, course_id)
+    await delete_pending(pending_id)
+
+    # уведомляем пользователя и отправляем видео
+    try:
+        await callback.bot.send_message(
+            user_id,
+            f"✅ Покупка подтверждена!\nКурс: **{course[1]}**\n\nОтправляю доступ...",
+            parse_mode="Markdown")
+        await callback.bot.send_video(
+            user_id, FSInputFile(VIDEO_PATH),
+            caption=f"Курс: {course[1]}")
+        await callback.bot.send_message(
+            user_id, "🏠 Главное меню 👇", reply_markup=main_reply_kb())
+    except Exception as e:
+        await callback.message.answer(f"⚠ Ошибка отправки пользователю: {e}")
+
+    try:
+        await callback.message.edit_text(callback.message.text + "\n\n✅ Подтверждено")
+    except TelegramBadRequest:
+        pass
+    await callback.answer("Подтверждено")
+
+
+@router.callback_query(F.data.startswith("admin_reject:"))
+async def admin_reject(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    pending_id = int(callback.data.split(":")[1])
+    pending = await get_pending(pending_id)
+    if not pending:
+        await callback.answer("Запрос не найден.", show_alert=True)
+        return
+
+    _, user_id, _ = pending
+    await delete_pending(pending_id)
+
+    try:
+        await callback.bot.send_message(
+            user_id,
+            "❌ К сожалению, покупка отклонена администратором.",
+            reply_markup=main_reply_kb())
+    except Exception:
+        pass
+
+    try:
+        await callback.message.edit_text(callback.message.text + "\n\n❌ Отклонено")
+    except TelegramBadRequest:
+        pass
+    await callback.answer("Отклонено")
+
+
+# ============================================================
+# АДМИН-ПАНЕЛЬ (РЕДАКТИРОВАНИЕ КУРСОВ)
 # ============================================================
 @router.message(Command("admin"))
 async def admin_start(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         await message.answer("⛔ У вас нет доступа.")
         return
-
     courses, _ = await get_courses(0)
     if not courses:
-        await message.answer("Нет курсов. Сначала добавьте курс командой /add.")
+        await message.answer("Нет курсов. Добавьте через /add.")
         return
-
     kb = InlineKeyboardBuilder()
     for course_id, name, price in courses:
         kb.button(text=f"{name} — {price}", callback_data=f"admin_edit:{course_id}")
     kb.button(text="➕ Добавить курс", callback_data="admin_add")
     kb.adjust(1)
-
-    await message.answer(
-        "🛠 Выберите курс для редактирования:",
-        reply_markup=kb.as_markup(),
-    )
+    await message.answer("🛠 Выберите курс для редактирования:",
+                         reply_markup=kb.as_markup())
     await state.set_state(AdminStates.choose_course)
 
 
@@ -395,7 +455,6 @@ async def admin_choose_course(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Нет доступа", show_alert=True)
         return
-
     course_id = int(callback.data.split(":")[1])
     await state.update_data(course_id=course_id)
     await callback.message.edit_text("Введите новое **название** курса:")
@@ -413,18 +472,11 @@ async def admin_enter_name(message: Message, state: FSMContext):
 @router.message(AdminStates.enter_price)
 async def admin_enter_price(message: Message, state: FSMContext):
     data = await state.get_data()
-    await update_course(
-        data["course_id"], data["new_name"], message.text.strip()
-    )
+    await update_course(data["course_id"], data["new_name"], message.text.strip())
     await state.clear()
-    await message.answer(
-        "✅ Курс обновлён.\n\n"
-        "Проверить можно в разделе «Курсы».",
-        reply_markup=main_inline_kb(),
-    )
+    await message.answer("✅ Курс обновлён.", reply_markup=main_inline_kb())
 
 
-# ---------- ДОБАВЛЕНИЕ НОВОГО КУРСА ----------
 @router.callback_query(F.data == "admin_add")
 async def admin_add_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
@@ -447,9 +499,7 @@ async def admin_create_price(message: Message, state: FSMContext):
     data = await state.get_data()
     await create_course(data["create_name"], message.text.strip())
     await state.clear()
-    await message.answer(
-        "✅ Новый курс добавлен.", reply_markup=main_inline_kb()
-    )
+    await message.answer("✅ Новый курс добавлен.", reply_markup=main_inline_kb())
 
 
 # ============================================================
