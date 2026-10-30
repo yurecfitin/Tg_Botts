@@ -1,4 +1,5 @@
 import asyncio
+import os
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
@@ -13,10 +14,6 @@ from aiogram.types import (
     KeyboardButton,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
-
-TOKEN = os.getenv("TOKEN")
-
-bot = Bot(token=TOKEN)
 
 BOT_TOKEN = os.getenv("TOKEN")
 ADMIN_ID = 6113518001  # замените на ваш Telegram ID
