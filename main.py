@@ -1,7 +1,6 @@
 import asyncio
-import re
-import os
 import aiosqlite
+import os
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -20,7 +19,6 @@ DB_PATH = "courses.db"
 PAGE_SIZE = 5
 
 router = Router()
-user_buy_page: dict[int, int] = {}
 
 # ============================================================
 # БАЗА ДАННЫХ
@@ -232,15 +230,18 @@ def courses_page_kb(page: int, total: int) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def buy_course_reply_kb(courses: list, user_id: int) -> ReplyKeyboardMarkup:
-    kb = ReplyKeyboardBuilder()
-    for i, (_, name, price) in enumerate(courses, start=1):
-        kb.button(text=f"{i}. {name} — {price}")
-    kb.button(text="🏠 Главное меню")
-    if user_id == ADMIN_ID:
-        kb.button(text="⚙️ Админ панель")
+def buy_menu_inline_kb(courses: list, page: int) -> InlineKeyboardMarkup:
+    """Выбор курса — inline-кнопки 1..5 + Назад."""
+    kb = InlineKeyboardBuilder()
+    for i, (course_id, name, price) in enumerate(courses, start=1):
+        kb.button(
+            text=f"{i}. {name} — {price}",
+            callback_data=f"pick_course:{course_id}:{page}"
+        )
     kb.adjust(1)
-    return kb.as_markup(resize_keyboard=True, one_time_keyboard=True)
+    kb.row(InlineKeyboardButton(text="⬅ Назад",
+                                callback_data=f"courses_page:{page}"))
+    return kb.as_markup()
 
 
 def course_detail_inline_kb(course_id: int, page: int,
@@ -290,7 +291,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
 
 # ============================================================
-# ГЛАВНОЕ МЕНЮ (нижняя кнопка + ручной ввод, работает в любом состоянии)
+# ГЛАВНОЕ МЕНЮ
 # ============================================================
 @router.message(F.text.in_({"Главное меню", "🏠 Главное меню"}))
 async def main_menu_text(message: Message, state: FSMContext):
@@ -303,9 +304,8 @@ async def main_menu_text(message: Message, state: FSMContext):
 @router.callback_query(F.data == "main_menu")
 async def main_menu_cb(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.answer("🏠 Главное меню",
-                                  reply_markup=user_reply_kb(callback.from_user.id))
-    await callback.message.answer("Выберите действие:", reply_markup=main_inline_kb())
+    await safe_edit(callback.message, "🏠 Главное меню\n\nВыберите действие:",
+                    main_inline_kb())
     await callback.answer()
 
 
@@ -336,55 +336,33 @@ async def buy_menu(callback: CallbackQuery):
         await safe_edit(callback.message, "Курсы не найдены.", main_inline_kb())
         await callback.answer()
         return
-    user_buy_page[callback.from_user.id] = page
-
-    back_kb = InlineKeyboardBuilder()
-    back_kb.button(text="⬅ Назад", callback_data=f"courses_page:{page}")
-    await safe_edit(callback.message, "Выберите курс из меню ниже:",
-                    back_kb.as_markup())
-    await callback.message.answer(
-        "Какой курс вы хотите купить?\nНажмите номер на клавиатуре ниже:",
-        reply_markup=buy_course_reply_kb(courses, callback.from_user.id))
+    await safe_edit(callback.message,
+                    "Какой курс вы хотите купить?",
+                    buy_menu_inline_kb(courses, page))
     await callback.answer()
 
 
-@router.message(StateFilter(None), F.text.regexp(r"^\d+"))
-async def pick_course_reply(message: Message):
-    user_id = message.from_user.id
-    page = user_buy_page.get(user_id, 0)
-    courses, _ = await get_courses(page)
-    if not courses:
-        await message.answer("🤷 Я вас не понял.",
-                             reply_markup=fallback_kb(user_id))
-        return
-
-    m = re.match(r"^(\d+)", message.text or "")
-    if not m:
-        await message.answer("🤷 Я вас не понял.",
-                             reply_markup=fallback_kb(user_id))
-        return
-
-    idx = int(m.group(1)) - 1
-    if idx < 0 or idx >= len(courses):
-        await message.answer("🤷 Я вас не понял.",
-                             reply_markup=fallback_kb(user_id))
-        return
-
-    course_id, name, price = courses[idx]
+@router.callback_query(F.data.startswith("pick_course:"))
+async def pick_course_cb(callback: CallbackQuery):
+    _, course_id_s, page_s = callback.data.split(":")
+    course_id = int(course_id_s)
+    page = int(page_s)
     course = await get_course(course_id)
-    if not course or not course[4]:
-        await message.answer("⚠ У этого курса нет ссылки на оплату.")
+    if not course:
+        await callback.answer("Курс не найден.", show_alert=True)
+        return
+    if not course[4]:
+        await callback.answer("⚠ У курса нет ссылки на оплату.", show_alert=True)
         return
 
-    # сбрасываем reply-панель к постоянной (Главное меню / Админ панель)
-    await message.answer("Курс выбран.",
-                         reply_markup=user_reply_kb(user_id))
-    await message.answer(
-        f"Вы выбрали:\n\n**{name}**\nЦена: **{price}**\n\n"
+    await safe_edit(
+        callback.message,
+        f"Вы выбрали:\n\n**{course[1]}**\nЦена: **{course[2]}**\n\n"
         f"1) Нажмите **💳 Купить** — откроется страница оплаты.\n"
         f"2) После оплаты нажмите **📸 Отправить чек** и пришлите скриншот.",
-        reply_markup=course_detail_inline_kb(course_id, page, course[4]),
+        course_detail_inline_kb(course_id, page, course[4]),
         parse_mode="Markdown")
+    await callback.answer()
 
 
 # ============================================================
@@ -412,6 +390,15 @@ async def start_receipt(callback: CallbackQuery, state: FSMContext):
         f"Администратор проверит чек и подтвердит покупку.",
         main_inline_kb(), parse_mode="Markdown")
     await callback.answer()
+
+
+@router.message(PurchaseStates.waiting_receipt,
+                F.text.in_({"Главное меню", "🏠 Главное меню"}))
+async def cancel_receipt(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Покупка отменена.",
+                         reply_markup=user_reply_kb(message.from_user.id))
+    await message.answer("Выберите действие:", reply_markup=main_inline_kb())
 
 
 @router.message(PurchaseStates.waiting_receipt, F.photo)
