@@ -13,6 +13,8 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiohttp import ClientTimeout
 
 BOT_TOKEN = os.getenv("TOKEN")
 ADMIN_ID = 6113518001
